@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own tmux pane inside a dedicated **subagents window** — separate from the window your orchestrator runs in, so spawning never splits or resizes your window, and zoom (`prefix z`) and focus are left exactly as you left them. Glance at the subagents window through the tmux window list whenever you want to watch the fleet. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,15 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+The subagents window is created detached on the first spawn (named `pi-subagents`, override with `PI_SUBAGENT_WINDOW_NAME`) and reused afterwards — every orchestrator in the tmux session, including nested sub-agents, shares the same observability window. Panes there are titled with their sub-agent's name and shown on the pane border, so you can tell them apart at a glance. The window disappears automatically when its last pane closes.
+
+Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout to the subagents window after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+
+Prefer the old behavior of splitting panes off the orchestrator's window? Set:
+
+```bash
+export PI_SUBAGENT_PLACEMENT=pane   # default: window
+```
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 

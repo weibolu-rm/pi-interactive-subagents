@@ -5,8 +5,11 @@
  * sending commands, reading screen output, and closing panes.
  * No LLM calls — fast and free.
  *
- * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ * Run inside tmux — best in a scratch session, since some tests exercise
+ * legacy pane placement and would split the window you run them from:
+ *
+ *   tmux new-session -d -s pi-isub-test -x 220 -y 50 \
+ *     'cd "$PWD" && npm run test:integration > /tmp/pi-isub-test.log 2>&1'
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -31,6 +34,12 @@ import {
   trackTempFile,
   waitForFile,
   waitForScreen,
+  waitForShellReady,
+  paneWindowId,
+  paneWindowName,
+  paneWindowLayout,
+  paneTitle,
+  windowExists,
   type TestEnv,
 } from "./harness.ts";
 
@@ -81,9 +90,70 @@ for (const backend of backends) {
       assert.equal(getFocusedSurface(), anchor);
     });
 
+    it("places subagent panes in a dedicated shared window, leaving the orchestrator window untouched", async () => {
+      // Isolate this test's window so sibling tests' panes can't keep it alive.
+      const windowName = `pi-subagents-test-${uniqueId()}`;
+      process.env.PI_SUBAGENT_WINDOW_NAME = windowName;
+      try {
+        const orchestrator = process.env.TMUX_PANE!;
+        const beforeWindow = paneWindowId(orchestrator);
+        const beforeLayout = paneWindowLayout(orchestrator);
+        const beforeFocus = getFocusedSurface();
+
+        const childA = createTrackedSurface(env, "win-child-a");
+        const childB = createTrackedSurface(env, "win-child-b");
+        await sleep(600); // let the debounced rebalance fire
+
+        // Both panes live in one dedicated window that is not the orchestrator's.
+        const windowA = paneWindowId(childA);
+        assert.notEqual(windowA, beforeWindow);
+        assert.equal(paneWindowId(childB), windowA);
+        assert.equal(paneWindowName(childA), windowName);
+
+        // Panes are titled with the subagent names for glanceability.
+        assert.equal(paneTitle(childA), "win-child-a");
+        assert.equal(paneTitle(childB), "win-child-b");
+
+        // The orchestrator window was not resized, refocused, or re-laid-out.
+        assert.equal(paneWindowId(orchestrator), beforeWindow);
+        assert.equal(paneWindowLayout(orchestrator), beforeLayout);
+        assert.equal(getFocusedSurface(), beforeFocus);
+
+        // Panes in the shared window are functional.
+        const marker = uniqueId();
+        sendCommand(childB, `echo "WIN_${marker}"`);
+        await waitForScreen(childB, new RegExp(`WIN_${marker}`), 20_000, 50);
+
+        // Closing the last subagent pane destroys the shared window.
+        closeSurface(childA);
+        untrackSurface(env, childA);
+        closeSurface(childB);
+        untrackSurface(env, childB);
+        assert.ok(!windowExists(windowA), "subagent window should die with its last pane");
+      } finally {
+        delete process.env.PI_SUBAGENT_WINDOW_NAME;
+      }
+    });
+
+    it("legacy placement (PI_SUBAGENT_PLACEMENT=pane) splits the orchestrator window", async () => {
+      process.env.PI_SUBAGENT_PLACEMENT = "pane";
+      try {
+        const orchestrator = process.env.TMUX_PANE!;
+        const surface = createTrackedSurface(env, "legacy-child");
+        await sleep(600); // let the debounced rebalance fire
+        assert.equal(
+          paneWindowId(surface),
+          paneWindowId(orchestrator),
+          "legacy placement should split in the orchestrator's window",
+        );
+      } finally {
+        delete process.env.PI_SUBAGENT_PLACEMENT;
+      }
+    });
+
     it("creates a surface, sends a command, reads output, and closes it", async () => {
       const surface = createTrackedSurface(env, "echo-test");
-      await sleep(1000);
+      await waitForShellReady(surface);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "MARKER_${marker}"`);
@@ -101,7 +171,7 @@ for (const backend of backends) {
 
     it("preserves shell special characters in echo output", async () => {
       const surface = createTrackedSurface(env, "escape-test");
-      await sleep(1000);
+      await waitForShellReady(surface);
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
@@ -122,7 +192,7 @@ for (const backend of backends) {
 
     it("sends a long command via script file without truncation", async () => {
       const surface = createTrackedSurface(env, "long-cmd-test");
-      await sleep(1000);
+      await waitForShellReady(surface);
 
       const marker = uniqueId();
       const longValue = "X".repeat(500);
@@ -144,7 +214,7 @@ for (const backend of backends) {
 
     it("reads screen asynchronously", async () => {
       const surface = createTrackedSurface(env, "async-read-test");
-      await sleep(1000);
+      await waitForShellReady(surface);
 
       const marker = uniqueId();
       sendCommand(surface, `echo "ASYNC_${marker}"`);
@@ -160,7 +230,7 @@ for (const backend of backends) {
     it("manages multiple surfaces concurrently", async () => {
       const s1 = createTrackedSurface(env, "multi-1");
       const s2 = createTrackedSurface(env, "multi-2");
-      await sleep(1500);
+      await Promise.all([waitForShellReady(s1), waitForShellReady(s2)]);
 
       const m1 = uniqueId();
       const m2 = uniqueId();
@@ -177,7 +247,7 @@ for (const backend of backends) {
 
     it("writes output to a file and verifies via surface", async () => {
       const surface = createTrackedSurface(env, "file-test");
-      await sleep(1000);
+      await waitForShellReady(surface);
 
       const marker = uniqueId();
       const filePath = `/tmp/pi-tmux-test-${marker}.txt`;

@@ -6,9 +6,11 @@
  * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
  * stays testable without a multiplexer running.
  *
- * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
- * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
- * the user's focus.
+ * Panes are identified by tmux pane ids (e.g. `%12`). By default sub-agent
+ * panes live in a dedicated shared window, separate from the orchestrator's
+ * window, so spawning never resizes it or disturbs a zoomed pane (prefix z).
+ * The low-level split primitive targets the parent pi's pane (`$TMUX_PANE`)
+ * so it follows the agent rather than the user's focus.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
@@ -67,7 +69,7 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
-// ── Pane layout ──
+// ── Pane placement ──
 
 /**
  * tmux layout applied to the subagent window to keep panes evenly sized.
@@ -76,27 +78,69 @@ export function shellEscape(s: string): string {
  */
 const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
 
+/**
+ * Name of the dedicated tmux window that hosts sub-agent panes. Override
+ * with PI_SUBAGENT_WINDOW_NAME. The window is found again by this name and
+ * by the `@pi-subagents` window marker (which stores this name and survives
+ * manual window renames), so every pi orchestrator in the session —
+ * including nested sub-agents — shares a single observability window
+ * instead of each spawning its own.
+ */
+function subagentWindowName(): string {
+  return process.env.PI_SUBAGENT_WINDOW_NAME ?? "pi-subagents";
+}
+
+/**
+ * Where sub-agent panes are created:
+ * - "window" (default): inside the dedicated shared subagent window. The
+ *   orchestrator's window is never split or resized, so zoom (prefix z) and
+ *   pane focus stay exactly as the user left them; the subagent window is
+ *   one glance away via the tmux window list.
+ * - "pane": legacy behaviour — a right split off the parent pi pane.
+ */
+function panePlacement(): "window" | "pane" {
+  return process.env.PI_SUBAGENT_PLACEMENT === "pane" ? "pane" : "window";
+}
+
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Cached id of the shared subagent window, once created or found. */
+let subagentWindowId: string | null = null;
 
 /**
  * Re-balance subagent panes so repeated splits don't leave them lopsided.
  * tmux halves the target pane on every split and dumps freed space onto a
  * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
+ * Applies SUBAGENT_TMUX_LAYOUT to the shared subagent window — never to the
+ * orchestrator's window, which must not be resized. Debounced so a burst
  * of parallel spawns or staggered exits collapses into a single layout call,
  * and non-fatal: a cosmetic resize must never break spawning or watching.
  */
 function rebalanceSurfaces(hintPane?: string): void {
-  // Prefer the parent pi pane (stable; survives a closing subagent pane).
-  const target = process.env.TMUX_PANE ?? hintPane;
+  if (panePlacement() === "pane") {
+    // Legacy placement: balance the parent pi's window (stable; survives a
+    // closing subagent pane).
+    scheduleRebalance(process.env.TMUX_PANE ?? hintPane);
+    return;
+  }
+  // Window placement: balance only the subagent window. Prefer the cached
+  // window id; fall back to the hint pane's window (hints are always
+  // subagent panes here, so this resolves to the shared window).
+  scheduleRebalance(subagentWindowId ?? (hintPane ? windowOfPane(hintPane) : null));
+}
+
+function scheduleRebalance(target: string | null | undefined): void {
   if (!target) return;
   if (rebalanceTimer) clearTimeout(rebalanceTimer);
   rebalanceTimer = setTimeout(() => {
     rebalanceTimer = null;
     try {
-      // -t <pane> resolves to that pane's window; does not change focus.
+      // -t <window> resolves to that window; does not change focus.
+      // stdio piped so a dead window's error stays in the catch instead of
+      // leaking to this process's stderr.
       execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
         encoding: "utf8",
+        stdio: "pipe",
       });
     } catch {
       // Pane/window may be gone; balancing is best-effort.
@@ -104,23 +148,169 @@ function rebalanceSurfaces(hintPane?: string): void {
   }, 120);
 }
 
+// ── Shared subagent window ──
+
+/**
+ * Find the shared subagent window in the current tmux session, if one
+ * exists. Matched by window name, or by the `@pi-subagents` window marker
+ * (which holds the name the window was created with, so it survives manual
+ * renames but not a changed PI_SUBAGENT_WINDOW_NAME). Returns the window id
+ * (e.g. `@3`) or null.
+ */
+function findSubagentWindow(): string | null {
+  try {
+    const out = execFileSync(
+      "tmux",
+      ["list-windows", "-F", "#{window_id}\t#{@pi-subagents}\t#{window_name}"],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+    const wanted = subagentWindowName();
+    for (const line of out.split("\n")) {
+      const [id, marker, ...rest] = line.trim().split("\t");
+      if (!id?.startsWith("@")) continue;
+      if (marker === wanted || rest.join("\t") === wanted) return id;
+    }
+  } catch {
+    // No server / no windows — treated as "not found".
+  }
+  return null;
+}
+
+/**
+ * Create the shared subagent window. `-d` keeps the client's current window
+ * selected, so focus does not move. Marks the window with `@pi-subagents`
+ * and turns on titled pane borders so panes are identifiable at a glance.
+ * Returns the new window id.
+ */
+function createSubagentWindow(): string {
+  const id = execFileSync(
+    "tmux",
+    ["new-window", "-d", "-n", subagentWindowName(), "-P", "-F", "#{window_id}"],
+    { encoding: "utf8", stdio: "pipe" },
+  ).trim();
+  if (!id.startsWith("@")) {
+    throw new Error(`Unexpected tmux new-window output: ${id}`);
+  }
+  try {
+    // Marker for reliable lookup even if the window is renamed later.
+    execFileSync("tmux", ["set-window-option", "-t", id, "@pi-subagents", subagentWindowName()], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+    // Show the pane title (the subagent's name) on a border line.
+    execFileSync("tmux", ["set-window-option", "-t", id, "pane-border-status", "top"], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+    execFileSync(
+      "tmux",
+      ["set-window-option", "-t", id, "pane-border-format", "#{pane_index}: #{pane_title}"],
+      { encoding: "utf8", stdio: "pipe" },
+    );
+  } catch {
+    // Cosmetic only — the window still works without borders or marker.
+  }
+  return id;
+}
+
+/** First pane id of a window, or null if the window is gone. */
+function firstPaneOfWindow(windowId: string): string | null {
+  try {
+    const out = execFileSync("tmux", ["list-panes", "-t", windowId, "-F", "#{pane_id}"], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+    const first = out.split("\n").find((line) => line.trim().startsWith("%"));
+    return first?.trim() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** The window id containing a pane, or null if the pane is gone. */
+function windowOfPane(paneId: string): string | null {
+  try {
+    const win = execFileSync("tmux", ["display-message", "-p", "-t", paneId, "#{window_id}"], {
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    return win.startsWith("@") ? win : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
+ * Create a new pane for a subagent.
+ *
+ * Default ("window" placement): the pane is created inside the dedicated
+ * shared subagent window — created detached on first spawn, reused
+ * afterwards. The orchestrator's window is never split or resized, so zoom
+ * (prefix z) and focus stay as the user left them; the subagent window is
+ * one glance away via the tmux window list. The pane's title is set to the
+ * subagent's name and shown on the pane border.
+ *
+ * Legacy ("pane" placement, `PI_SUBAGENT_PLACEMENT=pane`): a right split off
+ * the parent pi's pane, so new panes follow the agent rather than the user's
+ * focus. See https://github.com/HazAT/pi-interactive-subagents/issues/12
  *
  * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  if (panePlacement() === "pane") {
+    return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  }
+  return createSurfaceInSubagentWindow(name);
+}
+
+function createSurfaceInSubagentWindow(name: string): string {
+  requireTmux();
+
+  const existing = findSubagentWindow();
+  const windowId = existing ?? createSubagentWindow();
+  subagentWindowId = windowId;
+
+  let pane: string;
+  if (existing) {
+    // Split the window's first pane; rebalancing evens the layout out.
+    const anchor = firstPaneOfWindow(windowId);
+    if (!anchor) throw new Error(`Subagent window ${windowId} has no panes`);
+    pane = execFileSync(
+      "tmux",
+      ["split-window", "-d", "-h", "-t", anchor, "-P", "-F", "#{pane_id}"],
+      { encoding: "utf8", stdio: "pipe" },
+    ).trim();
+  } else {
+    // A fresh window already has one pane running the default shell — adopt
+    // it as the subagent's pane instead of leaving an idle shell behind.
+    pane = firstPaneOfWindow(windowId) ?? "";
+  }
+  if (!pane.startsWith("%")) {
+    throw new Error(`Unexpected tmux pane id: ${pane}`);
+  }
+
+  // Name the pane (shown on the border) so panes are identifiable at a glance.
+  try {
+    execFileSync("tmux", ["select-pane", "-t", pane, "-T", name], {
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+  } catch {
+    // Cosmetic only.
+  }
+
+  rebalanceSurfaces(pane);
+  return pane;
 }
 
 /**
  * Create a new split in the given direction from an optional source pane.
- * Returns the new pane id (e.g. `%12`).
+ * Low-level primitive: the split always lands in the source pane's window
+ * (or the parent pi's window when no source is given), i.e. legacy
+ * placement — `createSurface` is the real entry point and honors
+ * PI_SUBAGENT_PLACEMENT. Returns the new pane id (e.g. `%12`).
  */
 export function createSurfaceSplit(
   name: string,
