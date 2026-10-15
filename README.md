@@ -2,7 +2,15 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**Fork of [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents)** (itself a tmux-only fork of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which also supports cmux, zellij, and WezTerm). The only change here is where sub-agent panes live — see [Differences from upstream](#differences-from-upstream).
+
+## Differences from upstream
+
+Upstream splits every sub-agent pane off the orchestrator's pane. That resizes the orchestrator's window on each spawn and exit, kicks you out of `prefix z` zoom, and once a few agents are running the window gets so crowded you can't read any of them.
+
+This fork puts the panes in a dedicated tmux window instead. The orchestrator's window is never touched; the subagents window is there when you want to look at it and goes away when the last pane closes. Set `PI_SUBAGENT_PLACEMENT=pane` to get the old behavior back.
+
+Everything else is unchanged.
 
 ## How it works
 
@@ -37,7 +45,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in the shared subagents window (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -194,7 +202,7 @@ tmux new -A -s pi 'pi'
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Forked from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents), a tmux-only fork of [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents). HazAT's project originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 
