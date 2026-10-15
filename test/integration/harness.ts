@@ -88,15 +88,69 @@ export function focusSurface(surface: string): void {
 }
 
 export function getFocusedSurface(): string | null {
+  const scope = process.env.TMUX_PANE;
+  if (!scope) return null;
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
+    // List every pane of THIS session (-s), not just the current window, so
+    // "focused" is well-defined no matter which window the client is on:
+    // the pane that is active in a window that is itself active. Scoped to
+    // the test runner's session so other sessions can't confuse the result.
+    const panes = execFileSync(
+      "tmux",
+      ["list-panes", "-s", "-t", scope, "-F", "#{pane_id} #{pane_active} #{window_active}"],
+      {
+        encoding: "utf8",
+      },
+    );
+    const activeLine = panes
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => /^%\d+ 1 1$/.test(line));
     return activeLine?.split(" ")[0] ?? null;
   } catch {
     return null;
   }
+}
+
+// ── Window introspection ──
+
+/** The window id containing a pane (e.g. `@3`). */
+export function paneWindowId(surface: string): string {
+  return execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{window_id}"], {
+    encoding: "utf8",
+  }).trim();
+}
+
+/** A pane's title (set by the extension to the subagent's name). */
+export function paneTitle(surface: string): string {
+  return execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{pane_title}"], {
+    encoding: "utf8",
+  }).trim();
+}
+
+/** The name of the window containing a pane. */
+export function paneWindowName(surface: string): string {
+  return execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{window_name}"], {
+    encoding: "utf8",
+  }).trim();
+}
+
+/** Layout string of the window containing a pane (changes on any resize/split). */
+export function paneWindowLayout(surface: string): string {
+  return execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{window_layout}"], {
+    encoding: "utf8",
+  }).trim();
+}
+
+/** Whether a window id still exists in the current session. */
+export function windowExists(windowId: string): boolean {
+  const out = execFileSync("tmux", ["list-windows", "-F", "#{window_id}"], {
+    encoding: "utf8",
+  });
+  return out
+    .split("\n")
+    .map((line) => line.trim())
+    .includes(windowId);
 }
 
 export async function waitForFocusedSurface(
@@ -233,6 +287,29 @@ export function startPi(
 }
 
 // ── Polling helpers ──
+
+/**
+ * Wait until a pane's shell is accepting input. Probes with an idempotent
+ * echo and watches for it on screen: keystrokes sent before the shell is
+ * ready are lost (or garbled), which is what makes fixed sleeps flaky.
+ */
+export async function waitForShellReady(surface: string, timeout: number = 20_000): Promise<void> {
+  // Short so it stays on one screen line even in narrow panes (output wraps
+  // in very narrow panes and would never match a single-line check).
+  const marker = "RDY" + Math.random().toString(36).slice(2, 8);
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    sendCommand(surface, `echo "${marker}"`);
+    try {
+      const screen = readScreen(surface, 50);
+      // The probe's *output* is the marker alone on a line; the typed
+      // command itself also shows on screen (pty echo) and must not match.
+      if (screen.split("\n").some((line) => line.trim() === marker)) return;
+    } catch {}
+    await sleep(400);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for shell in pane ${surface}`);
+}
 
 /**
  * Poll until a regex pattern appears in the surface's screen output.
